@@ -52,6 +52,7 @@ const DEFAULT_STAMP_SETTINGS = {
   standardRewardPercent: 5,
   roundingIncrement: 10,
   roundingMethod: "floor",
+  cooldownHours: 6,
   isEnabled: true,
   giftTiers: [
     { id: "tier_1", minValue: 20, maxValue: 49, giftTitle: "SS Dessert Spoon / Knife", description: "Stainless steel spoon or knife" },
@@ -371,6 +372,7 @@ app.post("/api/stamp-settings", async (req, res) => {
       standardRewardPercent,
       roundingIncrement,
       roundingMethod,
+      cooldownHours,
       giftTiers,
       isEnabled
     } = req.body;
@@ -378,6 +380,7 @@ app.post("/api/stamp-settings", async (req, res) => {
     const updatePayload = {
       targetStamps: Math.max(1, Number(targetStamps) || 5),
       minInvoiceAmount: Math.max(0, Number(minInvoiceAmount) || 200),
+      cooldownHours: Number.isFinite(Number(cooldownHours)) ? Math.max(0, Number(cooldownHours)) : 6,
       specialKeywords: Array.isArray(specialKeywords) 
         ? specialKeywords.map(k => String(k).trim().toLowerCase()).filter(Boolean)
         : DEFAULT_STAMP_SETTINGS.specialKeywords,
@@ -489,12 +492,37 @@ app.get("/api/customer-stamps/:phone", async (req, res) => {
     if (!cleanPhone || cleanPhone.length < 10) {
       return res.status(400).json({ error: "Invalid mobile number" });
     }
+    const stampSettings = await ensureStampSettings();
+    const cooldownHours = Number(stampSettings.cooldownHours ?? 6);
+
     const doc = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
+
+    let lastStampedAt = doc?.lastStampedAt || null;
+    if (!lastStampedAt && doc?.activeCycle?.invoices?.length > 0) {
+      const invs = doc.activeCycle.invoices;
+      lastStampedAt = invs[invs.length - 1].stampedAt;
+    }
+
+    let inCooldown = false;
+    let cooldownRemainingMinutes = 0;
+    if (lastStampedAt) {
+      const elapsedMs = Date.now() - new Date(lastStampedAt).getTime();
+      const elapsedHours = elapsedMs / (1000 * 60 * 60);
+      if (elapsedHours < cooldownHours) {
+        inCooldown = true;
+        cooldownRemainingMinutes = Math.max(1, Math.round((cooldownHours - elapsedHours) * 60));
+      }
+    }
+
     if (!doc) {
       return res.json({
         exists: false,
         customerPhone: cleanPhone,
         customerName: "",
+        lastStampedAt: null,
+        inCooldown: false,
+        cooldownRemainingMinutes: 0,
+        cooldownHours,
         activeCycle: {
           cycleId: new ObjectId().toString(),
           cycleNumber: 1,
@@ -513,6 +541,10 @@ app.get("/api/customer-stamps/:phone", async (req, res) => {
       exists: true,
       customerPhone: doc.customerPhone,
       customerName: doc.customerName,
+      lastStampedAt,
+      inCooldown,
+      cooldownRemainingMinutes,
+      cooldownHours,
       activeCycle: doc.activeCycle || {
         cycleId: new ObjectId().toString(),
         cycleNumber: (doc.completedCycles?.length || 0) + 1,
@@ -1071,78 +1103,119 @@ app.post("/api/save-estimate", async (req, res) => {
             updatedAt: new Date()
           };
         } else {
-          // New Stamp Assignment
-          if (!activeCycle || activeCycle.status === 'completed' || activeCycle.status === 'reward_given') {
-            const completedCount = customerDoc?.completedCycles?.length || 0;
-            activeCycle = {
-              cycleId: new ObjectId().toString(),
-              cycleNumber: completedCount + 1,
-              currentStamps: 0,
+          // Check 6-Hour Cooldown Period between stamps
+          const cooldownHours = Number(stampSettings.cooldownHours ?? 6);
+          let lastStampedAt = customerDoc?.lastStampedAt || null;
+          if (!lastStampedAt && customerDoc?.activeCycle?.invoices?.length > 0) {
+            const invs = customerDoc.activeCycle.invoices;
+            lastStampedAt = invs[invs.length - 1].stampedAt;
+          }
+
+          let inCooldown = false;
+          let hoursRemaining = 0;
+          let minutesRemaining = 0;
+          if (lastStampedAt) {
+            const elapsedMs = sessionDate.getTime() - new Date(lastStampedAt).getTime();
+            const elapsedHours = elapsedMs / (1000 * 60 * 60);
+            if (elapsedHours < cooldownHours) {
+              inCooldown = true;
+              hoursRemaining = Number((cooldownHours - elapsedHours).toFixed(2));
+              minutesRemaining = Math.max(1, Math.round((cooldownHours - elapsedHours) * 60));
+            }
+          }
+
+          if (inCooldown) {
+            // Customer is in cooldown! Invoice saves normally, but awards 0 stamps and no reward contribution.
+            console.log(`⏳ [Cooldown] Customer ${cleanPhone} attempted stamp within ${cooldownHours}h cooldown (${minutesRemaining}m remaining). Stamping skipped.`);
+            stampData = {
+              isQualified: false,
+              stampProcessed: false,
+              inCooldown: true,
+              cooldownHours,
+              hoursRemaining,
+              minutesRemaining,
+              cycleId: activeCycle?.cycleId || null,
+              invoiceRewardValue: 0,
+              rawRewardValue: rawRewardTotal,
+              message: `Customer is in ${cooldownHours}-hour cooldown period. Next stamp eligible in ${Math.floor(minutesRemaining / 60)}h ${minutesRemaining % 60}m.`,
+              createdAt: sessionDate
+            };
+          } else {
+            // New Stamp Assignment
+            if (!activeCycle || activeCycle.status === 'completed' || activeCycle.status === 'reward_given') {
+              const completedCount = customerDoc?.completedCycles?.length || 0;
+              activeCycle = {
+                cycleId: new ObjectId().toString(),
+                cycleNumber: completedCount + 1,
+                currentStamps: 0,
+                targetStamps,
+                accumulatedRewardValue: 0,
+                status: 'active',
+                invoices: [],
+                createdAt: sessionDate
+              };
+            }
+
+            const nextStampNumber = (activeCycle.currentStamps || 0) + 1;
+            const newAccumulatedReward = (activeCycle.accumulatedRewardValue || 0) + invoiceRewardValue;
+            const isCycleComplete = nextStampNumber >= targetStamps;
+
+            activeCycle.currentStamps = nextStampNumber;
+            activeCycle.accumulatedRewardValue = newAccumulatedReward;
+            activeCycle.invoices = activeCycle.invoices || [];
+            activeCycle.invoices.push({
+              invoiceId: targetId,
+              invoiceDate: date,
+              invoiceAmount: Number(finalAmount) || 0,
+              rewardValue: invoiceRewardValue,
+              stampNumber: nextStampNumber,
+              stampedAt: sessionDate
+            });
+
+            if (isCycleComplete) {
+              activeCycle.status = 'completed';
+              activeCycle.completedAt = sessionDate;
+              activeCycle.eligibleGift = matchGiftTier(newAccumulatedReward, stampSettings.giftTiers);
+            }
+
+            await db.collection("customer_stamps").updateOne(
+              { customerPhone: cleanPhone },
+              {
+                $set: {
+                  customerName: customerName.trim(),
+                  customerPhone: cleanPhone,
+                  lastStampedAt: sessionDate,
+                  activeCycle,
+                  updatedAt: sessionDate
+                },
+                $inc: {
+                  totalLifetimeStamps: 1,
+                  totalLifetimeRewardValue: invoiceRewardValue
+                },
+                $setOnInsert: {
+                  createdAt: sessionDate,
+                  completedCycles: []
+                }
+              },
+              { upsert: true }
+            );
+
+            stampData = {
+              isQualified: true,
+              stampProcessed: true,
+              inCooldown: false,
+              cycleId: activeCycle.cycleId,
+              cycleNumber: activeCycle.cycleNumber,
+              stampNumber: nextStampNumber,
               targetStamps,
-              accumulatedRewardValue: 0,
-              status: 'active',
-              invoices: [],
-              createdAt: new Date()
+              invoiceRewardValue,
+              rawRewardValue: rawRewardTotal,
+              accumulatedCycleReward: newAccumulatedReward,
+              cycleCompleted: isCycleComplete,
+              eligibleGift: activeCycle.eligibleGift || null,
+              stampedAt: sessionDate
             };
           }
-
-          const nextStampNumber = (activeCycle.currentStamps || 0) + 1;
-          const newAccumulatedReward = (activeCycle.accumulatedRewardValue || 0) + invoiceRewardValue;
-          const isCycleComplete = nextStampNumber >= targetStamps;
-
-          activeCycle.currentStamps = nextStampNumber;
-          activeCycle.accumulatedRewardValue = newAccumulatedReward;
-          activeCycle.invoices = activeCycle.invoices || [];
-          activeCycle.invoices.push({
-            invoiceId: targetId,
-            invoiceDate: date,
-            invoiceAmount: Number(finalAmount) || 0,
-            rewardValue: invoiceRewardValue,
-            stampNumber: nextStampNumber,
-            stampedAt: new Date()
-          });
-
-          if (isCycleComplete) {
-            activeCycle.status = 'completed';
-            activeCycle.completedAt = new Date();
-            activeCycle.eligibleGift = matchGiftTier(newAccumulatedReward, stampSettings.giftTiers);
-          }
-
-          await db.collection("customer_stamps").updateOne(
-            { customerPhone: cleanPhone },
-            {
-              $set: {
-                customerName: customerName.trim(),
-                customerPhone: cleanPhone,
-                activeCycle,
-                updatedAt: new Date()
-              },
-              $inc: {
-                totalLifetimeStamps: 1,
-                totalLifetimeRewardValue: invoiceRewardValue
-              },
-              $setOnInsert: {
-                createdAt: new Date(),
-                completedCycles: []
-              }
-            },
-            { upsert: true }
-          );
-
-          stampData = {
-            isQualified: true,
-            stampProcessed: true,
-            cycleId: activeCycle.cycleId,
-            cycleNumber: activeCycle.cycleNumber,
-            stampNumber: nextStampNumber,
-            targetStamps,
-            invoiceRewardValue,
-            rawRewardValue: rawRewardTotal,
-            accumulatedCycleReward: newAccumulatedReward,
-            cycleCompleted: isCycleComplete,
-            eligibleGift: activeCycle.eligibleGift || null,
-            stampedAt: new Date()
-          };
         }
       } else {
         // Did not qualify for stamps (invoice total < minInvoiceAmount)
