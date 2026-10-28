@@ -22,17 +22,129 @@ async function ensureIndexes() {
     
     // Retail Invoice collection indexes
     await db.collection("retail_invoices").createIndex({ customerName: 1 });
+    await db.collection("retail_invoices").createIndex({ customerPhone: 1 });
     await db.collection("retail_invoices").createIndex({ date: -1 });
     await db.collection("retail_invoices").createIndex({ "newItems.name": 1 });
     await db.collection("retail_invoices").createIndex({ "scrapItems.name": 1 });
+    await db.collection("retail_invoices").createIndex({ "stampData.cycleId": 1 });
     
-    // Items collection index for fast rate lookups
+    // Wholesale Items collection index for fast rate lookups
     await db.collection("items").createIndex({ name: 1, type: 1 }, { unique: true });
+
+    // Separate Retail Items collection index
+    await db.collection("retail_items").createIndex({ name: 1, type: 1 }, { unique: true });
+
+    // Customer Stamps Loyalty Ledger indexes
+    await db.collection("customer_stamps").createIndex({ customerPhone: 1 }, { unique: true });
+    await db.collection("customer_stamps").createIndex({ customerName: 1 });
     
     console.log("🚀 [DB] Performance indexes verified");
   } catch (err) {
     console.error("❌ [DB] Index error:", err);
   }
+}
+
+const DEFAULT_STAMP_SETTINGS = {
+  targetStamps: 5,
+  minInvoiceAmount: 200,
+  specialKeywords: ["ss", "stainless steel", "aluminium", "aluminum", "al", "brass", "bronze"],
+  specialRewardPercent: 2,
+  standardRewardPercent: 5,
+  roundingIncrement: 10,
+  roundingMethod: "floor",
+  isEnabled: true,
+  giftTiers: [
+    { id: "tier_1", minValue: 20, maxValue: 49, giftTitle: "SS Dessert Spoon / Knife", description: "Stainless steel spoon or knife" },
+    { id: "tier_2", minValue: 50, maxValue: 99, giftTitle: "SS Peeler / Vegetable Cutter / Small Bowl", description: "Essential kitchen tool or small bowl" },
+    { id: "tier_3", minValue: 100, maxValue: 199, giftTitle: "SS Serving Tiffin / Deep Bowl", description: "Stainless steel serving bowl or 2-tier tiffin" },
+    { id: "tier_4", minValue: 200, maxValue: 499, giftTitle: "Premium SS Kadai / Saucepan", description: "Heavy gauge kadai or saucepan" },
+    { id: "tier_5", minValue: 500, maxValue: 999999, giftTitle: "Cookware Combo / Premium Appliance", description: "Premium cookware combo set" }
+  ]
+};
+
+async function ensureStampSettings() {
+  if (!dbClient) return DEFAULT_STAMP_SETTINGS;
+  try {
+    const db = dbClient.db("DMS");
+    let settings = await db.collection("stamp_settings").findOne({});
+    if (!settings) {
+      const initial = {
+        ...DEFAULT_STAMP_SETTINGS,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+      await db.collection("stamp_settings").insertOne(initial);
+      console.log("ℹ️ [DB] Initialized default stamp_settings with 5-stamp rules and gift tiers");
+      return initial;
+    }
+    return settings;
+  } catch (err) {
+    console.error("❌ [DB] Stamp settings error:", err);
+    return DEFAULT_STAMP_SETTINGS;
+  }
+}
+
+async function migrateRetailItemsCollection() {
+  if (!dbClient) return;
+  try {
+    const db = dbClient.db("DMS");
+    const count = await db.collection("retail_items").countDocuments();
+    if (count === 0) {
+      console.log("⏳ [DB] Migrating items to separate retail_items collection...");
+      const wholesaleItems = await db.collection("items").find({}).toArray();
+      if (wholesaleItems.length > 0) {
+        const bulkOps = wholesaleItems.map(item => ({
+          updateOne: {
+            filter: { name: item.name, type: item.type || 'new' },
+            update: {
+              $set: {
+                rate: Number(item.retail_rate ?? item.rate) || 0,
+                cost_price: Number(item.cost_price) || 0,
+                rewardPercent: null,
+                category: item.category || '',
+                updatedAt: new Date()
+              },
+              $setOnInsert: { createdAt: new Date() }
+            },
+            upsert: true
+          }
+        }));
+        await db.collection("retail_items").bulkWrite(bulkOps, { ordered: false });
+        console.log(`✅ [DB] Successfully initialized retail_items collection with ${wholesaleItems.length} items`);
+      }
+    }
+  } catch (err) {
+    console.error("❌ [DB] retail_items migration error:", err);
+  }
+}
+
+function isSpecialMetalItem(itemName, keywords) {
+  if (!itemName || typeof itemName !== 'string') return false;
+  const lower = itemName.toLowerCase().trim();
+  const list = (keywords && Array.isArray(keywords) && keywords.length > 0) ? keywords : DEFAULT_STAMP_SETTINGS.specialKeywords;
+  return list.some(kw => {
+    const cleanKw = kw.toLowerCase().trim();
+    if (!cleanKw) return false;
+    const regex = new RegExp(`(^|\\b|\\s|_)${cleanKw.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}(\\b|\\s|_|$)`, 'i');
+    return regex.test(lower) || lower.includes(cleanKw);
+  });
+}
+
+function matchGiftTier(accumulatedRewardValue, giftTiers) {
+  const tiers = (giftTiers && Array.isArray(giftTiers) && giftTiers.length > 0) ? giftTiers : DEFAULT_STAMP_SETTINGS.giftTiers;
+  const sorted = [...tiers].sort((a, b) => (Number(a.minValue) || 0) - (Number(b.minValue) || 0));
+  let matched = null;
+  for (const tier of sorted) {
+    const min = Number(tier.minValue) || 0;
+    const max = Number(tier.maxValue) || Infinity;
+    if (accumulatedRewardValue >= min && accumulatedRewardValue <= max) {
+      matched = tier;
+    }
+  }
+  if (!matched && sorted.length > 0 && accumulatedRewardValue > (Number(sorted[sorted.length - 1].minValue) || 0)) {
+    matched = sorted[sorted.length - 1];
+  }
+  return matched ? matched.giftTitle : `Gift worth ₹${accumulatedRewardValue}`;
 }
 
 async function migrateItemsFromInvoices() {
@@ -127,6 +239,8 @@ async function connectToMongo() {
     await ensureIndexes();
     await migrateItemsFromInvoices();
     await migrateRetailRateAndCostPrice();
+    await migrateRetailItemsCollection();
+    await ensureStampSettings();
   } catch (error) {
     console.warn("⚠️ [DB] MongoDB Offline (ECONNREFUSED / Timeout).", error.message);
     dbClient = null;
@@ -207,6 +321,267 @@ app.get("/api/customers", async (req, res) => {
     const allNames = [...new Set([...wholesaleNames, ...retailNames])];
     const sorted = allNames.filter(n => typeof n === 'string' && n.trim() !== '').sort();
     res.json(sorted);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Customer Lookup (name & phone for auto-suggest)
+app.get("/api/customer-lookup", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const [stampsList, retailInvoices] = await Promise.all([
+      db.collection("customer_stamps").find({}, { projection: { customerName: 1, customerPhone: 1, _id: 0 } }).toArray(),
+      db.collection("retail_invoices").find({ customerPhone: { $exists: true, $ne: "" } }, { projection: { customerName: 1, customerPhone: 1, _id: 0 } }).sort({ date: -1 }).limit(200).toArray()
+    ]);
+    const map = new Map();
+    [...stampsList, ...retailInvoices].forEach(item => {
+      const phone = String(item.customerPhone || '').replace(/\D/g, '');
+      if (phone && phone.length >= 10 && !map.has(phone)) {
+        map.set(phone, { phone, name: item.customerName || '' });
+      }
+    });
+    res.json(Array.from(map.values()));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stamp Settings Endpoints
+app.get("/api/stamp-settings", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const settings = await ensureStampSettings();
+    res.json(settings);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/stamp-settings", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const {
+      targetStamps,
+      minInvoiceAmount,
+      specialKeywords,
+      specialRewardPercent,
+      standardRewardPercent,
+      roundingIncrement,
+      roundingMethod,
+      giftTiers,
+      isEnabled
+    } = req.body;
+
+    const updatePayload = {
+      targetStamps: Math.max(1, Number(targetStamps) || 5),
+      minInvoiceAmount: Math.max(0, Number(minInvoiceAmount) || 200),
+      specialKeywords: Array.isArray(specialKeywords) 
+        ? specialKeywords.map(k => String(k).trim().toLowerCase()).filter(Boolean)
+        : DEFAULT_STAMP_SETTINGS.specialKeywords,
+      specialRewardPercent: Number(specialRewardPercent) || 2,
+      standardRewardPercent: Number(standardRewardPercent) || 5,
+      roundingIncrement: Number(roundingIncrement) || 10,
+      roundingMethod: roundingMethod || 'floor',
+      giftTiers: Array.isArray(giftTiers) ? giftTiers : DEFAULT_STAMP_SETTINGS.giftTiers,
+      isEnabled: typeof isEnabled === 'boolean' ? isEnabled : true,
+      updatedAt: new Date()
+    };
+
+    await db.collection("stamp_settings").updateOne(
+      {},
+      { $set: updatePayload },
+      { upsert: true }
+    );
+    res.json({ success: true, settings: updatePayload });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Retail Items (Separate catalog for retail estimates)
+app.get("/api/retail-items", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const allItems = await db.collection("retail_items").find({}).sort({ name: 1 }).toArray();
+    
+    const newItems = allItems.filter(i => i.type === 'new').map(i => ({ 
+      _id: i._id,
+      name: i.name, 
+      rate: Number(i.rate) || 0, 
+      retail_rate: Number(i.rate) || 0, 
+      cost_price: Number(i.cost_price) || 0,
+      rewardPercent: (i.rewardPercent !== undefined && i.rewardPercent !== null) ? Number(i.rewardPercent) : null,
+      category: i.category || ''
+    }));
+    const scrapItems = allItems.filter(i => i.type === 'scrap').map(i => ({ 
+      _id: i._id,
+      name: i.name, 
+      rate: Number(i.rate) || 0, 
+      retail_rate: Number(i.rate) || 0, 
+      cost_price: Number(i.cost_price) || 0,
+      rewardPercent: (i.rewardPercent !== undefined && i.rewardPercent !== null) ? Number(i.rewardPercent) : null,
+      category: i.category || ''
+    }));
+
+    res.json({ newItems, scrapItems });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/retail-items", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const { id, name, type, rate, cost_price, rewardPercent, category } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: "Item name is required" });
+    
+    const payload = {
+      name: name.trim(),
+      type: type === 'scrap' ? 'scrap' : 'new',
+      rate: Number(rate) || 0,
+      cost_price: Number(cost_price) || 0,
+      rewardPercent: (rewardPercent !== undefined && rewardPercent !== null && rewardPercent !== '') ? Number(rewardPercent) : null,
+      category: category ? String(category).trim() : '',
+      updatedAt: new Date()
+    };
+
+    if (id) {
+      await db.collection("retail_items").updateOne(
+        { _id: new ObjectId(id) },
+        { $set: payload }
+      );
+      res.json({ success: true, id });
+    } else {
+      const result = await db.collection("retail_items").updateOne(
+        { name: payload.name, type: payload.type },
+        { $set: payload, $setOnInsert: { createdAt: new Date() } },
+        { upsert: true }
+      );
+      res.json({ success: true, id: result.upsertedId || id });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete("/api/retail-items/:id", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    await db.collection("retail_items").deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Customer Stamp Status by Mobile Number (for external Web App & Mobile App)
+app.get("/api/customer-stamps/:phone", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const cleanPhone = String(req.params.phone || '').replace(/\D/g, '');
+    if (!cleanPhone || cleanPhone.length < 10) {
+      return res.status(400).json({ error: "Invalid mobile number" });
+    }
+    const doc = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
+    if (!doc) {
+      return res.json({
+        exists: false,
+        customerPhone: cleanPhone,
+        customerName: "",
+        activeCycle: {
+          cycleId: new ObjectId().toString(),
+          cycleNumber: 1,
+          currentStamps: 0,
+          targetStamps: 5,
+          accumulatedRewardValue: 0,
+          status: 'active',
+          invoices: []
+        },
+        completedCycles: [],
+        totalLifetimeStamps: 0,
+        totalLifetimeRewardValue: 0
+      });
+    }
+    res.json({
+      exists: true,
+      customerPhone: doc.customerPhone,
+      customerName: doc.customerName,
+      activeCycle: doc.activeCycle || {
+        cycleId: new ObjectId().toString(),
+        cycleNumber: (doc.completedCycles?.length || 0) + 1,
+        currentStamps: 0,
+        targetStamps: 5,
+        accumulatedRewardValue: 0,
+        status: 'active',
+        invoices: []
+      },
+      completedCycles: doc.completedCycles || [],
+      totalLifetimeStamps: doc.totalLifetimeStamps || 0,
+      totalLifetimeRewardValue: doc.totalLifetimeRewardValue || 0
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reward Handover (Ends completed cycle and starts next cycle for future visits)
+app.post("/api/customer-stamps/handover-reward", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const cleanPhone = String(req.body.phone || '').replace(/\D/g, '');
+    if (!cleanPhone || cleanPhone.length < 10) {
+      return res.status(400).json({ error: "Invalid mobile number" });
+    }
+    const doc = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
+    if (!doc || !doc.activeCycle || doc.activeCycle.status !== 'completed') {
+      return res.status(400).json({ error: "No completed stamp cycle ready for reward handover" });
+    }
+
+    const completedRecord = {
+      cycleId: doc.activeCycle.cycleId,
+      cycleNumber: doc.activeCycle.cycleNumber,
+      totalRewardValue: doc.activeCycle.accumulatedRewardValue,
+      stampsCount: doc.activeCycle.currentStamps,
+      giftGiven: doc.activeCycle.eligibleGift || "Completed 5-Stamp Reward",
+      completedAt: doc.activeCycle.completedAt || new Date(),
+      handedOverAt: new Date(),
+      invoiceIds: (doc.activeCycle.invoices || []).map(i => i.invoiceId)
+    };
+
+    const nextCycleNumber = (doc.completedCycles?.length || 0) + 2;
+    const newActiveCycle = {
+      cycleId: new ObjectId().toString(),
+      cycleNumber: nextCycleNumber,
+      currentStamps: 0,
+      targetStamps: 5,
+      accumulatedRewardValue: 0,
+      status: 'active',
+      invoices: [],
+      createdAt: new Date()
+    };
+
+    await db.collection("customer_stamps").updateOne(
+      { customerPhone: cleanPhone },
+      {
+        $push: { completedCycles: completedRecord },
+        $set: { activeCycle: newActiveCycle, updatedAt: new Date() }
+      }
+    );
+
+    res.json({
+      success: true,
+      message: "Reward handed over successfully! Customer has started a fresh stamp cycle.",
+      completedRecord,
+      activeCycle: newActiveCycle
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -541,12 +916,14 @@ app.post("/api/save-estimate", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "Database offline" });
   try {
     const db = dbClient.db("DMS");
-    const collectionName = req.body.billType === 'retail' ? 'retail_invoices' : 'invoices';
+    const isRetail = req.body.billType === 'retail';
+    const collectionName = isRetail ? 'retail_invoices' : 'invoices';
     const invoices = db.collection(collectionName);
     
     const { 
       id,
       customerName, 
+      customerPhone,
       date, 
       billType,
       newItems, 
@@ -569,6 +946,13 @@ app.post("/api/save-estimate", async (req, res) => {
     }
     if (!date) {
       return res.status(400).json({ error: "Date is required" });
+    }
+
+    const cleanPhone = String(customerPhone || '').replace(/\D/g, '');
+    if (isRetail) {
+      if (!cleanPhone || cleanPhone.length < 10) {
+        return res.status(400).json({ error: "Customer 10-digit mobile number is mandatory for Retail Estimates" });
+      }
     }
 
     const validateItems = (items, type) => {
@@ -598,11 +982,193 @@ app.post("/api/save-estimate", async (req, res) => {
     const isUpdate = !!id;
     const targetId = isUpdate ? new ObjectId(id) : new ObjectId();
 
+    // Reward and Stamp Engine for Retail Invoices
+    let stampData = null;
+    let processedNewItems = newItems;
+
+    if (isRetail) {
+      const stampSettings = await ensureStampSettings();
+      const minInvoiceAmount = Number(stampSettings.minInvoiceAmount) || 200;
+      const specialKeywords = stampSettings.specialKeywords || DEFAULT_STAMP_SETTINGS.specialKeywords;
+      const specialRewardPercent = Number(stampSettings.specialRewardPercent) || 2;
+      const standardRewardPercent = Number(stampSettings.standardRewardPercent) || 5;
+      const roundingIncrement = Number(stampSettings.roundingIncrement) || 10;
+      const targetStamps = Number(stampSettings.targetStamps) || 5;
+
+      // 1. Calculate item-level rewards
+      let rawRewardTotal = 0;
+      processedNewItems = (newItems || []).map(item => {
+        let percent = standardRewardPercent;
+        if (item.rewardPercent !== undefined && item.rewardPercent !== null && item.rewardPercent !== '') {
+          percent = Number(item.rewardPercent);
+        } else if (isSpecialMetalItem(item.name, specialKeywords)) {
+          percent = specialRewardPercent;
+        }
+
+        const itemTotal = Number(item.total) || (Number(item.quantity) * Number(item.rate)) || 0;
+        const itemReward = Number(((itemTotal * percent) / 100).toFixed(2));
+        rawRewardTotal += itemReward;
+
+        return {
+          ...item,
+          rewardPercent: percent,
+          rewardValue: itemReward
+        };
+      });
+
+      rawRewardTotal = Number(rawRewardTotal.toFixed(2));
+
+      // Rounding logic: floor to nearest 10 when >= 10, otherwise keep raw reward (e.g. ₹4 on ₹200 SS bill)
+      const invoiceRewardValue = rawRewardTotal >= roundingIncrement 
+        ? Math.floor(rawRewardTotal / roundingIncrement) * roundingIncrement 
+        : Math.round(rawRewardTotal);
+
+      const isQualified = Number(finalAmount) >= minInvoiceAmount;
+
+      if (isQualified) {
+        // Fetch or initialize customer stamp record
+        const customerDoc = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
+        let activeCycle = customerDoc?.activeCycle;
+
+        // Check if updating an existing invoice that was already stamped
+        let existingInvoice = null;
+        if (isUpdate) {
+          existingInvoice = await invoices.findOne({ _id: targetId });
+        }
+
+        if (existingInvoice && existingInvoice.stampData && existingInvoice.stampData.stampProcessed) {
+          // Lock invoice to its existing cycle and stamp number (prevent double counting)
+          const prevCycleId = existingInvoice.stampData.cycleId;
+          const prevRewardVal = Number(existingInvoice.stampData.invoiceRewardValue) || 0;
+          const rewardDiff = invoiceRewardValue - prevRewardVal;
+
+          if (activeCycle && activeCycle.cycleId === prevCycleId && rewardDiff !== 0) {
+            activeCycle.accumulatedRewardValue = Math.max(0, (activeCycle.accumulatedRewardValue || 0) + rewardDiff);
+            // Update the invoice in activeCycle.invoices array
+            activeCycle.invoices = (activeCycle.invoices || []).map(inv => {
+              if (String(inv.invoiceId) === String(targetId)) {
+                return { ...inv, invoiceAmount: Number(finalAmount), rewardValue: invoiceRewardValue };
+              }
+              return inv;
+            });
+            if (activeCycle.status === 'completed') {
+              activeCycle.eligibleGift = matchGiftTier(activeCycle.accumulatedRewardValue, stampSettings.giftTiers);
+            }
+            await db.collection("customer_stamps").updateOne(
+              { customerPhone: cleanPhone },
+              { 
+                $set: { activeCycle, updatedAt: new Date() },
+                $inc: { totalLifetimeRewardValue: rewardDiff }
+              }
+            );
+          }
+
+          stampData = {
+            ...existingInvoice.stampData,
+            invoiceRewardValue,
+            rawRewardValue: rawRewardTotal,
+            accumulatedCycleReward: activeCycle?.accumulatedRewardValue || existingInvoice.stampData.accumulatedCycleReward,
+            updatedAt: new Date()
+          };
+        } else {
+          // New Stamp Assignment
+          if (!activeCycle || activeCycle.status === 'completed' || activeCycle.status === 'reward_given') {
+            const completedCount = customerDoc?.completedCycles?.length || 0;
+            activeCycle = {
+              cycleId: new ObjectId().toString(),
+              cycleNumber: completedCount + 1,
+              currentStamps: 0,
+              targetStamps,
+              accumulatedRewardValue: 0,
+              status: 'active',
+              invoices: [],
+              createdAt: new Date()
+            };
+          }
+
+          const nextStampNumber = (activeCycle.currentStamps || 0) + 1;
+          const newAccumulatedReward = (activeCycle.accumulatedRewardValue || 0) + invoiceRewardValue;
+          const isCycleComplete = nextStampNumber >= targetStamps;
+
+          activeCycle.currentStamps = nextStampNumber;
+          activeCycle.accumulatedRewardValue = newAccumulatedReward;
+          activeCycle.invoices = activeCycle.invoices || [];
+          activeCycle.invoices.push({
+            invoiceId: targetId,
+            invoiceDate: date,
+            invoiceAmount: Number(finalAmount) || 0,
+            rewardValue: invoiceRewardValue,
+            stampNumber: nextStampNumber,
+            stampedAt: new Date()
+          });
+
+          if (isCycleComplete) {
+            activeCycle.status = 'completed';
+            activeCycle.completedAt = new Date();
+            activeCycle.eligibleGift = matchGiftTier(newAccumulatedReward, stampSettings.giftTiers);
+          }
+
+          await db.collection("customer_stamps").updateOne(
+            { customerPhone: cleanPhone },
+            {
+              $set: {
+                customerName: customerName.trim(),
+                customerPhone: cleanPhone,
+                activeCycle,
+                updatedAt: new Date()
+              },
+              $inc: {
+                totalLifetimeStamps: 1,
+                totalLifetimeRewardValue: invoiceRewardValue
+              },
+              $setOnInsert: {
+                createdAt: new Date(),
+                completedCycles: []
+              }
+            },
+            { upsert: true }
+          );
+
+          stampData = {
+            isQualified: true,
+            stampProcessed: true,
+            cycleId: activeCycle.cycleId,
+            cycleNumber: activeCycle.cycleNumber,
+            stampNumber: nextStampNumber,
+            targetStamps,
+            invoiceRewardValue,
+            rawRewardValue: rawRewardTotal,
+            accumulatedCycleReward: newAccumulatedReward,
+            cycleCompleted: isCycleComplete,
+            eligibleGift: activeCycle.eligibleGift || null,
+            stampedAt: new Date()
+          };
+        }
+      } else {
+        // Did not qualify for stamps (invoice total < minInvoiceAmount)
+        stampData = {
+          isQualified: false,
+          stampProcessed: false,
+          cycleId: null,
+          cycleNumber: null,
+          stampNumber: 0,
+          targetStamps,
+          invoiceRewardValue: 0,
+          rawRewardValue: rawRewardTotal,
+          accumulatedCycleReward: 0,
+          cycleCompleted: false,
+          eligibleGift: null,
+          reason: `Invoice total ₹${finalAmount} is below qualifying minimum of ₹${minInvoiceAmount}`
+        };
+      }
+    }
+
     const masterPayload = {
-      customerName,
+      customerName: customerName.trim(),
+      customerPhone: cleanPhone || '',
       date,
       billType: billType || 'wholesale',
-      newItems,
+      newItems: processedNewItems,
       scrapItems,
       newTotal,
       scrapTotal,
@@ -629,34 +1195,46 @@ app.post("/api/save-estimate", async (req, res) => {
       updatedAt: sessionDate,
     };
 
+    if (isRetail && stampData) {
+      masterPayload.stampData = stampData;
+    }
+
     if (isUpdate) {
       await invoices.updateOne(
         { _id: targetId },
         { $set: masterPayload }
       );
-      res.json({ success: true, id: targetId });
+      res.json({ success: true, id: targetId, stampData });
     } else {
       const result = await invoices.insertOne({
         ...masterPayload,
         _id: targetId,
         createdAt: sessionDate,
       });
-      res.json({ success: true, id: result.insertedId });
+      res.json({ success: true, id: result.insertedId, stampData });
     }
 
-    // Async background update of items collection with latest rates
-    const rateField = (billType === 'retail') ? 'retail_rate' : 'rate';
+    // Async background update of retail_items (for retail) or items (for wholesale)
     setImmediate(async () => {
       try {
+        const targetCollection = isRetail ? "retail_items" : "items";
+        const rateField = isRetail ? "rate" : "rate";
         const bulkOps = [];
         
-        if (newItems && Array.isArray(newItems)) {
-          newItems.forEach((item) => {
+        if (processedNewItems && Array.isArray(processedNewItems)) {
+          processedNewItems.forEach((item) => {
             if (item.name && String(item.name).trim() !== '') {
+              const updateDoc = {
+                [rateField]: Number(item.rate) || 0,
+                updatedAt: new Date()
+              };
+              if (isRetail && item.rewardPercent !== undefined && item.rewardPercent !== null) {
+                updateDoc.rewardPercent = Number(item.rewardPercent);
+              }
               bulkOps.push({
                 updateOne: {
-                  filter: { name: item.name, type: 'new' },
-                  update: { $set: { [rateField]: Number(item.rate) || 0, updatedAt: new Date() } },
+                  filter: { name: item.name.trim(), type: 'new' },
+                  update: { $set: updateDoc },
                   upsert: true
                 }
               });
@@ -669,7 +1247,7 @@ app.post("/api/save-estimate", async (req, res) => {
             if (item.name && String(item.name).trim() !== '') {
               bulkOps.push({
                 updateOne: {
-                  filter: { name: item.name, type: 'scrap' },
+                  filter: { name: item.name.trim(), type: 'scrap' },
                   update: { $set: { [rateField]: Number(item.rate) || 0, updatedAt: new Date() } },
                   upsert: true
                 }
@@ -679,8 +1257,8 @@ app.post("/api/save-estimate", async (req, res) => {
         }
 
         if (bulkOps.length > 0) {
-          await db.collection("items").bulkWrite(bulkOps, { ordered: false });
-          console.log(`✅ [DB] Bulk upserted ${bulkOps.length} ${rateField} rates`);
+          await db.collection(targetCollection).bulkWrite(bulkOps, { ordered: false });
+          console.log(`✅ [DB] Bulk upserted ${bulkOps.length} items in ${targetCollection}`);
         }
       } catch (bgErr) {
         console.error("❌ [DB] Background items update failed:", bgErr);
