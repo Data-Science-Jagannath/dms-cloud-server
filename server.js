@@ -27,6 +27,7 @@ async function ensureIndexes() {
     await db.collection("retail_invoices").createIndex({ "newItems.name": 1 });
     await db.collection("retail_invoices").createIndex({ "scrapItems.name": 1 });
     await db.collection("retail_invoices").createIndex({ "stampData.cycleId": 1 });
+    await db.collection("retail_invoices").createIndex({ invoiceNo: 1 });
     
     // Wholesale Items collection index for fast rate lookups
     await db.collection("items").createIndex({ name: 1, type: 1 }, { unique: true });
@@ -417,6 +418,7 @@ app.get("/api/retail-items", async (req, res) => {
       rate: Number(i.rate) || 0, 
       retail_rate: Number(i.rate) || 0, 
       cost_price: Number(i.cost_price) || 0,
+      gst: (i.gst !== undefined && i.gst !== null) ? Number(i.gst) : 0,
       rewardPercent: (i.rewardPercent !== undefined && i.rewardPercent !== null) ? Number(i.rewardPercent) : null,
       category: i.category || ''
     }));
@@ -426,6 +428,7 @@ app.get("/api/retail-items", async (req, res) => {
       rate: Number(i.rate) || 0, 
       retail_rate: Number(i.rate) || 0, 
       cost_price: Number(i.cost_price) || 0,
+      gst: (i.gst !== undefined && i.gst !== null) ? Number(i.gst) : 0,
       rewardPercent: (i.rewardPercent !== undefined && i.rewardPercent !== null) ? Number(i.rewardPercent) : null,
       category: i.category || ''
     }));
@@ -440,7 +443,7 @@ app.post("/api/retail-items", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "DB Offline" });
   try {
     const db = dbClient.db("DMS");
-    const { id, name, type, rate, cost_price, rewardPercent, category } = req.body;
+    const { id, name, type, rate, cost_price, gst, rewardPercent, category } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: "Item name is required" });
     
     const payload = {
@@ -448,6 +451,7 @@ app.post("/api/retail-items", async (req, res) => {
       type: type === 'scrap' ? 'scrap' : 'new',
       rate: Number(rate) || 0,
       cost_price: Number(cost_price) || 0,
+      gst: (gst !== undefined && gst !== null && gst !== '') ? Number(gst) : 0,
       rewardPercent: (rewardPercent !== undefined && rewardPercent !== null && rewardPercent !== '') ? Number(rewardPercent) : null,
       category: category ? String(category).trim() : '',
       updatedAt: new Date()
@@ -563,6 +567,169 @@ app.get("/api/customer-stamps/:phone", async (req, res) => {
   }
 });
 
+// In-memory OTP storage for Cloud Server: phone -> { otp, expiresAt }
+const cloudOtpStore = new Map();
+
+// Send OTP via WhatsApp
+app.post("/api/rewards/otp/send", async (req, res) => {
+  try {
+    const rawPhone = String(req.body.phone || '').replace(/\D/g, '');
+    const cleanPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+    if (cleanPhone.length !== 10) {
+      return res.status(400).json({ error: "Invalid 10-digit mobile number" });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + (5 * 60 * 1000);
+    cloudOtpStore.set(cleanPhone, { otp, expiresAt });
+
+    const msg = `Namaste from Durga Metal Shop! Your loyalty verification code is: *${otp}*.\n\nValid for 5 minutes to access your 5-stamp rewards pass.`;
+    const storeWa = process.env.WHATSAPP_PHONE_NUMBER || "9937009855";
+    const waLink = `https://wa.me/91${storeWa}?text=${encodeURIComponent(msg)}`;
+
+    let smsSent = false;
+    let smsError = null;
+    const fast2smsKey = process.env.FAST2SMS_API_KEY;
+    if (fast2smsKey) {
+      try {
+        const fastResp = await fetch("https://www.fast2sms.com/dev/bulkV2", {
+          method: "POST",
+          headers: {
+            "authorization": fast2smsKey,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            route: "otp",
+            variables_values: otp,
+            numbers: cleanPhone
+          })
+        });
+        const fastData = await fastResp.json();
+        if (fastData && fastData.return === true) {
+          smsSent = true;
+        } else {
+          smsError = fastData.message || JSON.stringify(fastData);
+        }
+      } catch (err) {
+        smsError = err.message;
+      }
+    }
+
+    res.json({
+      success: true,
+      phone: cleanPhone,
+      message: `OTP generated for +91 ${cleanPhone}`,
+      smsSent,
+      smsProvider: fast2smsKey ? "fast2sms" : null,
+      smsNote: smsError,
+      directWhatsappLink: waLink,
+      debug_otp: otp,
+      expiresInSeconds: 300
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Verify OTP
+app.post("/api/rewards/otp/verify", async (req, res) => {
+  try {
+    const rawPhone = String(req.body.phone || '').replace(/\D/g, '');
+    const cleanPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+    const inputOtp = String(req.body.otp || '').trim();
+
+    let isValid = (inputOtp === "123456"); // master demo fallback
+    if (!isValid && cloudOtpStore.has(cleanPhone)) {
+      const record = cloudOtpStore.get(cleanPhone);
+      if (Date.now() <= record.expiresAt && record.otp === inputOtp) {
+        isValid = true;
+        cloudOtpStore.delete(cleanPhone);
+      }
+    }
+
+    if (!isValid) {
+      return res.status(400).json({ error: "Invalid or expired OTP code" });
+    }
+
+    let customerName = "Valued Customer";
+    if (dbClient) {
+      const db = dbClient.db("DMS");
+      const cust = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
+      if (cust?.customerName) customerName = cust.customerName;
+      else {
+        const inv = await db.collection("retail_invoices").findOne({ customerPhone: cleanPhone });
+        if (inv?.customerName) customerName = inv.customerName;
+      }
+    }
+
+    res.json({
+      success: true,
+      verified: true,
+      customerPhone: cleanPhone,
+      customerName
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Qualified Invoices for Customer (Strict: only invoices that qualified for rewards)
+app.get("/api/rewards/invoices/:phone", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const rawPhone = String(req.params.phone || '').replace(/\D/g, '');
+    const cleanPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+    if (cleanPhone.length !== 10) {
+      return res.status(400).json({ error: "Invalid 10-digit mobile number" });
+    }
+
+    const invoices = await db.collection("retail_invoices")
+      .find({ customerPhone: cleanPhone, "stampData.isQualified": true })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const formatted = invoices.map(inv => ({
+      invoiceId: inv._id.toString(),
+      customerName: inv.customerName || "Customer",
+      customerPhone: inv.customerPhone,
+      date: inv.date,
+      finalAmount: inv.finalAmount || 0,
+      paidAmount: inv.paidAmount || 0,
+      items: (inv.newItems || []).map(it => ({
+        name: it.name || "Item",
+        quantity: it.quantity || 1,
+        rate: it.rate || 0,
+        total: it.total || 0,
+        rewardPercent: it.rewardPercent || 2,
+        rewardValue: it.rewardValue || 0
+      })),
+      stampData: {
+        isQualified: true,
+        stampProcessed: inv.stampData?.stampProcessed ?? true,
+        cycleId: inv.stampData?.cycleId?.toString() || "",
+        cycleNumber: inv.stampData?.cycleNumber || 1,
+        stampNumber: inv.stampData?.stampNumber || 1,
+        invoiceRewardValue: inv.stampData?.invoiceRewardValue || 0,
+        rawRewardValue: inv.stampData?.rawRewardValue || 0,
+        accumulatedCycleReward: inv.stampData?.accumulatedCycleReward || 0,
+        cycleCompleted: inv.stampData?.cycleCompleted || false,
+        eligibleGift: inv.stampData?.eligibleGift || null,
+        stampedAt: inv.stampData?.stampedAt || inv.date
+      }
+    }));
+
+    res.json({
+      success: true,
+      customerPhone: cleanPhone,
+      count: formatted.length,
+      invoices: formatted
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Reward Handover (Ends completed cycle and starts next cycle for future visits)
 app.post("/api/customer-stamps/handover-reward", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "DB Offline" });
@@ -613,6 +780,169 @@ app.post("/api/customer-stamps/handover-reward", async (req, res) => {
       message: "Reward handed over successfully! Customer has started a fresh stamp cycle.",
       completedRecord,
       activeCycle: newActiveCycle
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// In-memory OTP storage for Cloud Server: phone -> { otp, expiresAt }
+const cloudOtpStore = new Map();
+
+// Send OTP via WhatsApp
+app.post("/api/rewards/otp/send", async (req, res) => {
+  try {
+    const rawPhone = String(req.body.phone || '').replace(/\D/g, '');
+    const cleanPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+    if (cleanPhone.length !== 10) {
+      return res.status(400).json({ error: "Invalid 10-digit mobile number" });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + (5 * 60 * 1000);
+    cloudOtpStore.set(cleanPhone, { otp, expiresAt });
+
+    const msg = `Namaste from Durga Metal Shop! Your loyalty verification code is: *${otp}*.\n\nValid for 5 minutes to access your 5-stamp rewards pass.`;
+    const storeWa = process.env.WHATSAPP_PHONE_NUMBER || "9937009855";
+    const waLink = `https://wa.me/91${storeWa}?text=${encodeURIComponent(msg)}`;
+
+    let smsSent = false;
+    let smsError = null;
+    const fast2smsKey = process.env.FAST2SMS_API_KEY;
+    if (fast2smsKey) {
+      try {
+        const fastResp = await fetch("https://www.fast2sms.com/dev/bulkV2", {
+          method: "POST",
+          headers: {
+            "authorization": fast2smsKey,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            route: "otp",
+            variables_values: otp,
+            numbers: cleanPhone
+          })
+        });
+        const fastData = await fastResp.json();
+        if (fastData && fastData.return === true) {
+          smsSent = true;
+        } else {
+          smsError = fastData.message || JSON.stringify(fastData);
+        }
+      } catch (err) {
+        smsError = err.message;
+      }
+    }
+
+    res.json({
+      success: true,
+      phone: cleanPhone,
+      message: `OTP generated for +91 ${cleanPhone}`,
+      smsSent,
+      smsProvider: fast2smsKey ? "fast2sms" : null,
+      smsNote: smsError,
+      directWhatsappLink: waLink,
+      debug_otp: otp,
+      expiresInSeconds: 300
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Verify OTP
+app.post("/api/rewards/otp/verify", async (req, res) => {
+  try {
+    const rawPhone = String(req.body.phone || '').replace(/\D/g, '');
+    const cleanPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+    const inputOtp = String(req.body.otp || '').trim();
+
+    let isValid = (inputOtp === "123456"); // master demo fallback
+    if (!isValid && cloudOtpStore.has(cleanPhone)) {
+      const record = cloudOtpStore.get(cleanPhone);
+      if (Date.now() <= record.expiresAt && record.otp === inputOtp) {
+        isValid = true;
+        cloudOtpStore.delete(cleanPhone);
+      }
+    }
+
+    if (!isValid) {
+      return res.status(400).json({ error: "Invalid or expired OTP code" });
+    }
+
+    let customerName = "Valued Customer";
+    if (dbClient) {
+      const db = dbClient.db("DMS");
+      const cust = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
+      if (cust?.customerName) customerName = cust.customerName;
+      else {
+        const inv = await db.collection("retail_invoices").findOne({ customerPhone: cleanPhone });
+        if (inv?.customerName) customerName = inv.customerName;
+      }
+    }
+
+    res.json({
+      success: true,
+      verified: true,
+      customerPhone: cleanPhone,
+      customerName
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Qualified Invoices for Customer (Strict: only invoices that qualified for rewards)
+app.get("/api/rewards/invoices/:phone", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const rawPhone = String(req.params.phone || '').replace(/\D/g, '');
+    const cleanPhone = rawPhone.length > 10 ? rawPhone.slice(-10) : rawPhone;
+    if (cleanPhone.length !== 10) {
+      return res.status(400).json({ error: "Invalid 10-digit mobile number" });
+    }
+
+    const invoices = await db.collection("retail_invoices")
+      .find({ customerPhone: cleanPhone, "stampData.isQualified": true })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const formatted = invoices.map(inv => ({
+      invoiceId: inv._id.toString(),
+      customerName: inv.customerName || "Customer",
+      customerPhone: inv.customerPhone,
+      date: inv.date,
+      finalAmount: inv.finalAmount || 0,
+      paidAmount: inv.paidAmount || 0,
+      items: (inv.newItems || []).map(it => ({
+        name: it.name || "Item",
+        quantity: it.quantity || 1,
+        rate: it.rate || 0,
+        total: it.total || 0,
+        rewardPercent: it.rewardPercent || 2,
+        rewardValue: it.rewardValue || 0
+      })),
+      stampData: {
+        isQualified: true,
+        stampProcessed: inv.stampData?.stampProcessed ?? true,
+        cycleId: inv.stampData?.cycleId?.toString() || "",
+        cycleNumber: inv.stampData?.cycleNumber || 1,
+        stampNumber: inv.stampData?.stampNumber || 1,
+        invoiceRewardValue: inv.stampData?.invoiceRewardValue || 0,
+        rawRewardValue: inv.stampData?.rawRewardValue || 0,
+        accumulatedCycleReward: inv.stampData?.accumulatedCycleReward || 0,
+        cycleCompleted: inv.stampData?.cycleCompleted || false,
+        eligibleGift: inv.stampData?.eligibleGift || null,
+        stampedAt: inv.stampData?.stampedAt || inv.date
+      }
+    }));
+
+    res.json({
+      success: true,
+      customerPhone: cleanPhone,
+      count: formatted.length,
+      invoices: formatted
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -781,7 +1111,13 @@ app.get("/api/estimates", async (req, res) => {
   try {
     const db = dbClient.db("DMS");
     let query = {};
-    if (name) query.customerName = { $regex: name, $options: "i" };
+    if (name) {
+      query.$or = [
+        { customerName: { $regex: name, $options: "i" } },
+        { customerPhone: { $regex: name, $options: "i" } },
+        { invoiceNo: { $regex: name, $options: "i" } }
+      ];
+    }
     if (date) query.date = date;
 
     const estimates = await db.collection(collectionName)
@@ -943,6 +1279,38 @@ app.get("/api/last-balance/:name", async (req, res) => {
   }
 });
 
+// Next Sequential Bill Number for Retail (Fixed prefix DMS, Year YY, Month MM based on bill date)
+app.get("/api/next-bill-number", async (req, res) => {
+  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+  try {
+    const db = dbClient.db("DMS");
+    const { billType, date } = req.query;
+    if (billType !== 'retail') {
+      return res.json({ invoiceNo: null });
+    }
+    const dateParts = String(date || '').split('-');
+    const yy = (dateParts[0] && dateParts[0].length >= 4) ? dateParts[0].slice(-2) : String(new Date().getFullYear()).slice(-2);
+    const mm = (dateParts[1] && dateParts[1].length >= 1) ? dateParts[1].padStart(2, '0') : String(new Date().getMonth() + 1).padStart(2, '0');
+    const period = `${yy}${mm}`;
+
+    const counterDoc = await db.collection("counters").findOne({ _id: `retail_bill_${period}` });
+    let currentSeq = counterDoc?.seq || 0;
+    if (currentSeq === 0) {
+      const pattern = new RegExp(`^DMS[/\\-]${period}[/\\-](\\d+)`);
+      const lastInv = await db.collection("retail_invoices").find({ invoiceNo: { $regex: pattern } }).sort({ invoiceNo: -1 }).limit(1).toArray();
+      if (lastInv.length > 0 && lastInv[0].invoiceNo) {
+        const m = lastInv[0].invoiceNo.match(pattern);
+        if (m && m[1]) currentSeq = parseInt(m[1], 10);
+      }
+    }
+    const nextSeq = currentSeq + 1;
+    const invoiceNo = `DMS/${period}/${String(nextSeq).padStart(4, '0')}`;
+    res.json({ invoiceNo });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Save Estimate Endpoint
 app.post("/api/save-estimate", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "Database offline" });
@@ -954,6 +1322,7 @@ app.post("/api/save-estimate", async (req, res) => {
     
     const { 
       id,
+      invoiceNo: reqInvoiceNo,
       customerName, 
       customerPhone,
       date, 
@@ -1043,6 +1412,7 @@ app.post("/api/save-estimate", async (req, res) => {
 
         return {
           ...item,
+          gst: (item.gst !== undefined && item.gst !== null) ? Number(item.gst) : 0,
           rewardPercent: percent,
           rewardValue: itemReward
         };
@@ -1268,6 +1638,34 @@ app.post("/api/save-estimate", async (req, res) => {
       updatedAt: sessionDate,
     };
 
+    let finalInvoiceNo = reqInvoiceNo;
+    if (isRetail) {
+      let existingInvoice = null;
+      if (isUpdate) {
+        existingInvoice = await invoices.findOne({ _id: targetId });
+      }
+
+      if (existingInvoice && existingInvoice.invoiceNo) {
+        finalInvoiceNo = existingInvoice.invoiceNo;
+      } else {
+        // Sequential Bill Number: Fixed prefix DMS, Year YY, Month MM depending on bill date
+        const dateParts = String(date || '').split('-');
+        const yy = (dateParts[0] && dateParts[0].length >= 4) ? dateParts[0].slice(-2) : String(new Date().getFullYear()).slice(-2);
+        const mm = (dateParts[1] && dateParts[1].length >= 1) ? dateParts[1].padStart(2, '0') : String(new Date().getMonth() + 1).padStart(2, '0');
+        const period = `${yy}${mm}`;
+
+        // Atomic counter increment
+        const counterDoc = await db.collection("counters").findOneAndUpdate(
+          { _id: `retail_bill_${period}` },
+          { $inc: { seq: 1 } },
+          { upsert: true, returnDocument: 'after' }
+        );
+        const nextSeq = counterDoc?.seq || counterDoc?.value?.seq || 1;
+        finalInvoiceNo = `DMS/${period}/${String(nextSeq).padStart(4, '0')}`;
+      }
+      masterPayload.invoiceNo = finalInvoiceNo;
+    }
+
     if (isRetail && stampData) {
       masterPayload.stampData = stampData;
     }
@@ -1277,14 +1675,14 @@ app.post("/api/save-estimate", async (req, res) => {
         { _id: targetId },
         { $set: masterPayload }
       );
-      res.json({ success: true, id: targetId, stampData });
+      res.json({ success: true, id: targetId, invoiceNo: finalInvoiceNo, stampData });
     } else {
       const result = await invoices.insertOne({
         ...masterPayload,
         _id: targetId,
         createdAt: sessionDate,
       });
-      res.json({ success: true, id: result.insertedId, stampData });
+      res.json({ success: true, id: result.insertedId, invoiceNo: finalInvoiceNo, stampData });
     }
 
     // Async background update of retail_items (for retail) or items (for wholesale)
@@ -1301,8 +1699,13 @@ app.post("/api/save-estimate", async (req, res) => {
                 [rateField]: Number(item.rate) || 0,
                 updatedAt: new Date()
               };
-              if (isRetail && item.rewardPercent !== undefined && item.rewardPercent !== null) {
-                updateDoc.rewardPercent = Number(item.rewardPercent);
+              if (isRetail) {
+                if (item.rewardPercent !== undefined && item.rewardPercent !== null) {
+                  updateDoc.rewardPercent = Number(item.rewardPercent);
+                }
+                if (item.gst !== undefined && item.gst !== null) {
+                  updateDoc.gst = Number(item.gst);
+                }
               }
               bulkOps.push({
                 updateOne: {
