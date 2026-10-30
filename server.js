@@ -28,6 +28,13 @@ async function ensureIndexes() {
     await db.collection("retail_invoices").createIndex({ "scrapItems.name": 1 });
     await db.collection("retail_invoices").createIndex({ "stampData.cycleId": 1 });
     await db.collection("retail_invoices").createIndex({ invoiceNo: 1 });
+
+    // Retail Estimates collection indexes
+    await db.collection("retail_estimates").createIndex({ customerName: 1 });
+    await db.collection("retail_estimates").createIndex({ customerPhone: 1 });
+    await db.collection("retail_estimates").createIndex({ date: -1 });
+    await db.collection("retail_estimates").createIndex({ "newItems.name": 1 });
+    await db.collection("retail_estimates").createIndex({ "scrapItems.name": 1 });
     
     // Wholesale Items collection index for fast rate lookups
     await db.collection("items").createIndex({ name: 1, type: 1 }, { unique: true });
@@ -316,11 +323,12 @@ app.get("/api/customers", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "DB Offline" });
   try {
     const db = dbClient.db("DMS");
-    const [wholesaleNames, retailNames] = await Promise.all([
+    const [wholesaleNames, retailNames, retailEstimateNames] = await Promise.all([
       db.collection("invoices").distinct("customerName"),
-      db.collection("retail_invoices").distinct("customerName")
+      db.collection("retail_invoices").distinct("customerName"),
+      db.collection("retail_estimates").distinct("customerName")
     ]);
-    const allNames = [...new Set([...wholesaleNames, ...retailNames])];
+    const allNames = [...new Set([...wholesaleNames, ...retailNames, ...retailEstimateNames])];
     const sorted = allNames.filter(n => typeof n === 'string' && n.trim() !== '').sort();
     res.json(sorted);
   } catch (error) {
@@ -333,12 +341,13 @@ app.get("/api/customer-lookup", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "DB Offline" });
   try {
     const db = dbClient.db("DMS");
-    const [stampsList, retailInvoices] = await Promise.all([
+    const [stampsList, retailInvoices, retailEstimates] = await Promise.all([
       db.collection("customer_stamps").find({}, { projection: { customerName: 1, customerPhone: 1, _id: 0 } }).toArray(),
-      db.collection("retail_invoices").find({ customerPhone: { $exists: true, $ne: "" } }, { projection: { customerName: 1, customerPhone: 1, _id: 0 } }).sort({ date: -1 }).limit(200).toArray()
+      db.collection("retail_invoices").find({ customerPhone: { $exists: true, $ne: "" } }, { projection: { customerName: 1, customerPhone: 1, _id: 0 } }).sort({ date: -1 }).limit(200).toArray(),
+      db.collection("retail_estimates").find({ customerPhone: { $exists: true, $ne: "" } }, { projection: { customerName: 1, customerPhone: 1, _id: 0 } }).sort({ date: -1 }).limit(200).toArray()
     ]);
     const map = new Map();
-    [...stampsList, ...retailInvoices].forEach(item => {
+    [...stampsList, ...retailInvoices, ...retailEstimates].forEach(item => {
       const phone = String(item.customerPhone || '').replace(/\D/g, '');
       if (phone && phone.length >= 10 && !map.has(phone)) {
         map.set(phone, { phone, name: item.customerName || '' });
@@ -792,7 +801,9 @@ app.get("/api/stats-summary", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "DB Offline" });
   
   const { startDate, endDate, customerName, newItemName, scrapItemName, billType } = req.query;
-  const collectionName = billType === 'retail' ? 'retail_invoices' : 'invoices';
+  const collectionName = billType === 'retail_estimate' 
+    ? 'retail_estimates' 
+    : (billType === 'retail' ? 'retail_invoices' : 'invoices');
   
   try {
     const db = dbClient.db("DMS");
@@ -944,7 +955,9 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/estimates", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "Database offline" });
   const { name, date, billType } = req.query;
-  const collectionName = billType === 'retail' ? 'retail_invoices' : 'invoices';
+  const collectionName = billType === 'retail_estimate' 
+    ? 'retail_estimates' 
+    : (billType === 'retail' ? 'retail_invoices' : 'invoices');
   try {
     const db = dbClient.db("DMS");
     let query = {};
@@ -1088,7 +1101,9 @@ app.get("/api/merchant-last-balance/:name", async (req, res) => {
 // Customer Last Balance
 app.get("/api/last-balance/:name", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "DB Offline" });
-  const collectionName = req.query.billType === 'retail' ? 'retail_invoices' : 'invoices';
+  const collectionName = req.query.billType === 'retail_estimate' 
+    ? 'retail_estimates' 
+    : (req.query.billType === 'retail' ? 'retail_invoices' : 'invoices');
   try {
     const db = dbClient.db("DMS");
     const name = req.params.name.trim();
@@ -1153,9 +1168,12 @@ app.post("/api/save-estimate", async (req, res) => {
   if (!dbClient) return res.status(503).json({ error: "Database offline" });
   try {
     const db = dbClient.db("DMS");
-    const isRetail = req.body.billType === 'retail';
-    const collectionName = isRetail ? 'retail_invoices' : 'invoices';
+    const isRetailGst = req.body.billType === 'retail';
+    const isRetailEstimate = req.body.billType === 'retail_estimate';
+    const isRetailCatalog = isRetailGst || isRetailEstimate;
+    const collectionName = isRetailEstimate ? 'retail_estimates' : (isRetailGst ? 'retail_invoices' : 'invoices');
     const invoices = db.collection(collectionName);
+    const isRetail = isRetailGst;
     
     const { 
       id,
@@ -1463,17 +1481,28 @@ app.post("/api/save-estimate", async (req, res) => {
       remainingDue,
       financial_summary: {
         bill_amount: finalAmount,
-        discount: Number(discount) || 0,
-        previous_balance: oldBalance,
-        total_payable: totalOutstanding,
-        cash_paid: Number(cashAmount) || 0,
-        online_paid: Number(onlineAmount) || 0,
-        online_mode: Number(onlineAmount) > 0 ? (onlineMode || '') : '',
-        amount_paid: paidAmount,
-        remaining_due: remainingDue
+        discount: isRetailGst ? 0 : (Number(discount) || 0),
+        previous_balance: isRetailGst ? 0 : oldBalance,
+        total_payable: isRetailGst ? finalAmount : totalOutstanding,
+        cash_paid: isRetailGst ? finalAmount : (Number(cashAmount) || 0),
+        online_paid: isRetailGst ? 0 : (Number(onlineAmount) || 0),
+        online_mode: isRetailGst ? '' : (Number(onlineAmount) > 0 ? (onlineMode || '') : ''),
+        amount_paid: isRetailGst ? finalAmount : paidAmount,
+        remaining_due: isRetailGst ? 0 : remainingDue,
+        round_off: Number(req.body.roundOff) || 0
       },
+      roundOff: Number(req.body.roundOff) || 0,
       updatedAt: sessionDate,
     };
+
+    if (isRetailGst) {
+      masterPayload.scrapItems = [];
+      masterPayload.scrapTotal = 0;
+      masterPayload.discount = 0;
+      masterPayload.oldBalance = 0;
+      masterPayload.paidAmount = finalAmount;
+      masterPayload.remainingDue = 0;
+    }
 
     let finalInvoiceNo = reqInvoiceNo;
     if (isRetail) {
@@ -1525,18 +1554,17 @@ app.post("/api/save-estimate", async (req, res) => {
     // Async background update of retail_items (for retail) or items (for wholesale)
     setImmediate(async () => {
       try {
-        const targetCollection = isRetail ? "retail_items" : "items";
-        const rateField = isRetail ? "rate" : "rate";
+        const targetCollection = isRetailCatalog ? "retail_items" : "items";
         const bulkOps = [];
         
         if (processedNewItems && Array.isArray(processedNewItems)) {
           processedNewItems.forEach((item) => {
             if (item.name && String(item.name).trim() !== '') {
               const updateDoc = {
-                [rateField]: Number(item.rate) || 0,
+                rate: Number(item.rate) || 0,
                 updatedAt: new Date()
               };
-              if (isRetail) {
+              if (isRetailGst) {
                 if (item.rewardPercent !== undefined && item.rewardPercent !== null) {
                   updateDoc.rewardPercent = Number(item.rewardPercent);
                 }
