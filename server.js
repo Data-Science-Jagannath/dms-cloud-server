@@ -156,6 +156,15 @@ function matchGiftTier(accumulatedRewardValue, giftTiers) {
   return matched ? matched.giftTitle : `Gift worth ₹${accumulatedRewardValue}`;
 }
 
+function generateRedemptionCode() {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let randomPart = '';
+  for (let i = 0; i < 5; i++) {
+    randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `DMS${randomPart}`;
+}
+
 async function migrateItemsFromInvoices() {
   if (!dbClient) return;
   try {
@@ -596,44 +605,42 @@ app.post("/api/rewards/otp/send", async (req, res) => {
     const storeWa = process.env.WHATSAPP_PHONE_NUMBER || "9937009855";
     const waLink = `https://wa.me/91${storeWa}?text=${encodeURIComponent(msg)}`;
 
-    let smsSent = false;
-    let smsError = null;
+    let whatsappSent = false;
+    let whatsappError = null;
     const fast2smsKey = process.env.FAST2SMS_API_KEY;
     if (fast2smsKey) {
       try {
-        const fastResp = await fetch("https://www.fast2sms.com/dev/bulkV2", {
-          method: "POST",
+        const messageId = process.env.FAST2SMS_WHATSAPP_MESSAGE_ID || "40684";
+        const phoneNumberId = process.env.FAST2SMS_PHONE_NUMBER_ID || "1392837487245908";
+        const url = `https://www.fast2sms.com/dev/whatsapp?message_id=${encodeURIComponent(messageId)}&phone_number_id=${encodeURIComponent(phoneNumberId)}&numbers=${encodeURIComponent(cleanPhone)}&variables_values=${encodeURIComponent(otp)}`;
+
+        const fastResp = await fetch(url, {
+          method: "GET",
           headers: {
-            "authorization": fast2smsKey,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            route: "otp",
-            variables_values: otp,
-            numbers: cleanPhone
-          })
+            "Authorization": fast2smsKey
+          }
         });
         const fastData = await fastResp.json();
-        if (fastData && fastData.return === true) {
-          smsSent = true;
+        if (fastData && (fastData.return === true || fastData.status === true)) {
+          whatsappSent = true;
         } else {
-          smsError = fastData.message || JSON.stringify(fastData);
+          whatsappError = fastData.message || JSON.stringify(fastData);
         }
       } catch (err) {
-        smsError = err.message;
+        whatsappError = err.message;
       }
     }
 
     res.json({
       success: true,
       phone: cleanPhone,
-      message: `OTP generated for +91 ${cleanPhone}`,
-      smsSent,
-      smsProvider: fast2smsKey ? "fast2sms" : null,
-      smsNote: smsError,
+      message: whatsappSent ? `Verification code sent to WhatsApp for +91 ${cleanPhone}` : `OTP generated for +91 ${cleanPhone}`,
+      whatsappSent,
+      smsProvider: fast2smsKey ? "fast2sms_whatsapp" : null,
+      smsNote: whatsappError,
       directWhatsappLink: waLink,
       debug_otp: otp,
-      expiresInSeconds: 300
+      expiresInSeconds: 600
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -739,61 +746,195 @@ app.get("/api/rewards/invoices/:phone", async (req, res) => {
   }
 });
 
-// Reward Handover (Ends completed cycle and starts next cycle for future visits)
-app.post("/api/customer-stamps/handover-reward", async (req, res) => {
-  if (!dbClient) return res.status(503).json({ error: "DB Offline" });
-  try {
-    const db = dbClient.db("DMS");
-    const cleanPhone = String(req.body.phone || '').replace(/\D/g, '');
-    if (!cleanPhone || cleanPhone.length < 10) {
-      return res.status(400).json({ error: "Invalid mobile number" });
-    }
-    const doc = await db.collection("customer_stamps").findOne({ customerPhone: cleanPhone });
-    if (!doc || !doc.activeCycle || doc.activeCycle.status !== 'completed') {
-      return res.status(400).json({ error: "No completed stamp cycle ready for reward handover" });
-    }
-
-    const completedRecord = {
-      cycleId: doc.activeCycle.cycleId,
-      cycleNumber: doc.activeCycle.cycleNumber,
-      totalRewardValue: doc.activeCycle.accumulatedRewardValue,
-      stampsCount: doc.activeCycle.currentStamps,
-      giftGiven: doc.activeCycle.eligibleGift || "Completed 5-Stamp Reward",
-      completedAt: doc.activeCycle.completedAt || new Date(),
-      handedOverAt: new Date(),
-      invoiceIds: (doc.activeCycle.invoices || []).map(i => i.invoiceId)
-    };
-
-    const nextCycleNumber = (doc.completedCycles?.length || 0) + 2;
-    const newActiveCycle = {
-      cycleId: new ObjectId().toString(),
-      cycleNumber: nextCycleNumber,
-      currentStamps: 0,
-      targetStamps: 5,
-      accumulatedRewardValue: 0,
-      status: 'active',
-      invoices: [],
-      createdAt: new Date()
-    };
-
-    await db.collection("customer_stamps").updateOne(
-      { customerPhone: cleanPhone },
-      {
-        $push: { completedCycles: completedRecord },
-        $set: { activeCycle: newActiveCycle, updatedAt: new Date() }
+  // Verify Store Redemption Code (checks completedCycles under customer_stamps)
+  app.get("/api/customer-stamps/verify-code/:code", async (req, res) => {
+    if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+    try {
+      const db = dbClient.db("DMS");
+      const rawCode = String(req.params.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
+      if (!rawCode || rawCode.length < 3) {
+        return res.status(400).json({ error: "Please enter a valid redemption code or customer mobile number" });
       }
-    );
 
-    res.json({
-      success: true,
-      message: "Reward handed over successfully! Customer has started a fresh stamp cycle.",
-      completedRecord,
-      activeCycle: newActiveCycle
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+      // Query customer_stamps where completedCycles.redemptionCode matches or activeCycle matches
+      let doc = await db.collection("customer_stamps").findOne({
+        $or: [
+          { "completedCycles.redemptionCode": { $regex: new RegExp(`^${rawCode}$`, "i") } },
+          { "activeCycle.redemptionCode": { $regex: new RegExp(`^${rawCode}$`, "i") } }
+        ]
+      });
+
+      // Fallback: check by customer mobile number
+      if (!doc && rawCode.length === 10 && /^\d+$/.test(rawCode)) {
+        doc = await db.collection("customer_stamps").findOne({ customerPhone: rawCode });
+      }
+
+      if (!doc) {
+        return res.status(404).json({
+          success: false,
+          error: "No completed reward found for code " + rawCode
+        });
+      }
+
+      // Find the matching cycle in completedCycles first
+      let matchedCycle = (doc.completedCycles || []).find(c =>
+        c.redemptionCode && String(c.redemptionCode).trim().toUpperCase() === rawCode
+      );
+
+      // Fallback: check activeCycle
+      if (!matchedCycle && doc.activeCycle && doc.activeCycle.redemptionCode &&
+          String(doc.activeCycle.redemptionCode).trim().toUpperCase() === rawCode) {
+        matchedCycle = doc.activeCycle;
+      }
+
+      // If searched by 10-digit phone, find the latest unredeemed cycle in completedCycles or completed activeCycle
+      if (!matchedCycle && /^\d{10}$/.test(rawCode)) {
+        matchedCycle = (doc.completedCycles || []).slice().reverse().find(c => !c.redeemedOnBill);
+        if (!matchedCycle && doc.activeCycle && (doc.activeCycle.status === 'completed' || doc.activeCycle.currentStamps >= 5) && !doc.activeCycle.redeemedOnBill) {
+          matchedCycle = doc.activeCycle;
+        }
+      }
+
+      if (!matchedCycle) {
+        return res.status(404).json({
+          success: false,
+          error: "No completed reward cycle found for " + rawCode
+        });
+      }
+
+      // Note: if they already took the reward, reject the code
+      if (matchedCycle.redeemedOnBill || matchedCycle.isRedeemed) {
+        const invInfo = matchedCycle.redeemedInvoiceNo ? ` on Invoice #${matchedCycle.redeemedInvoiceNo}` : '';
+        const dateInfo = matchedCycle.redeemedAt ? ` on ${new Date(matchedCycle.redeemedAt).toLocaleDateString('en-IN')}` : '';
+        return res.status(400).json({
+          success: false,
+          isAlreadyRedeemed: true,
+          error: `This reward code (${matchedCycle.redemptionCode || rawCode}) was already redeemed${invInfo}${dateInfo}.`
+        });
+      }
+
+      res.json({
+        success: true,
+        customer: {
+          phone: doc.customerPhone,
+          name: doc.customerName || "Valued Customer",
+          cycleNumber: matchedCycle.cycleNumber || 1,
+          stamps: matchedCycle.stampsCount || matchedCycle.currentStamps || 5,
+          accumulatedRewardValue: Number(matchedCycle.totalRewardValue ?? matchedCycle.accumulatedRewardValue) || 0,
+          eligibleGift: matchedCycle.giftGiven || matchedCycle.eligibleGift || "SS Serving Tiffin / Deep Dining Bowl",
+          redemptionCode: matchedCycle.redemptionCode || rawCode,
+          cycleId: matchedCycle.cycleId
+        }
+      });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Reward Handover & Acceptance (Marks reward as taken / redeemed on bill or counter)
+  app.post("/api/customer-stamps/handover-reward", async (req, res) => {
+    if (!dbClient) return res.status(503).json({ error: "DB Offline" });
+    try {
+      const db = dbClient.db("DMS");
+      const cleanPhone = String(req.body.phone || '').replace(/\D/g, '');
+      const rawCode = String(req.body.redemptionCode || '').toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
+      const invoiceNo = req.body.invoiceNo || null;
+      const notes = req.body.notes || (invoiceNo ? `Reward item added to invoice #${invoiceNo}` : 'Handed over at store counter');
+
+      if (!cleanPhone && !rawCode) {
+        return res.status(400).json({ error: "Customer mobile number or redemption code required" });
+      }
+
+      // 1. Search in completedCycles under customer_stamps
+      const query = rawCode
+        ? { "completedCycles.redemptionCode": { $regex: new RegExp(`^${rawCode}$`, "i") } }
+        : { customerPhone: cleanPhone, "completedCycles.redeemedOnBill": { $ne: true } };
+
+      const doc = await db.collection("customer_stamps").findOne(query);
+      if (doc && Array.isArray(doc.completedCycles)) {
+        const targetIdx = doc.completedCycles.findIndex(c =>
+          rawCode ? (c.redemptionCode && String(c.redemptionCode).trim().toUpperCase() === rawCode) : !c.redeemedOnBill
+        );
+
+        if (targetIdx !== -1) {
+          const updateField = `completedCycles.${targetIdx}`;
+          await db.collection("customer_stamps").updateOne(
+            { _id: doc._id },
+            {
+              $set: {
+                [`${updateField}.redeemedOnBill`]: true,
+                [`${updateField}.isRedeemed`]: true,
+                [`${updateField}.redeemedInvoiceNo`]: invoiceNo,
+                [`${updateField}.redeemedAt`]: new Date(),
+                [`${updateField}.notes`]: notes,
+                updatedAt: new Date()
+              }
+            }
+          );
+          return res.json({
+            success: true,
+            message: `Reward gift accepted and recorded successfully!`,
+            giftGiven: doc.completedCycles[targetIdx].giftGiven || "Loyalty Reward Gift"
+          });
+        }
+      }
+
+      // 2. If it was in activeCycle (not yet rolled over by frontend pass), archive to completedCycles marked as redeemed
+      const activeQuery = rawCode
+        ? { "activeCycle.redemptionCode": { $regex: new RegExp(`^${rawCode}$`, "i") } }
+        : { customerPhone: cleanPhone, "activeCycle.status": "completed" };
+
+      const activeDoc = await db.collection("customer_stamps").findOne(activeQuery);
+      if (activeDoc && activeDoc.activeCycle && (activeDoc.activeCycle.status === 'completed' || activeDoc.activeCycle.currentStamps >= 5)) {
+        const completedRecord = {
+          cycleId: activeDoc.activeCycle.cycleId,
+          cycleNumber: activeDoc.activeCycle.cycleNumber,
+          totalRewardValue: activeDoc.activeCycle.accumulatedRewardValue,
+          stampsCount: activeDoc.activeCycle.currentStamps,
+          giftGiven: activeDoc.activeCycle.eligibleGift || "Completed 5-Stamp Reward Gift",
+          redemptionCode: rawCode || activeDoc.activeCycle.redemptionCode,
+          redeemedOnBill: true,
+          isRedeemed: true,
+          redeemedInvoiceNo: invoiceNo,
+          redeemedAt: new Date(),
+          notes,
+          completedAt: activeDoc.activeCycle.completedAt || new Date(),
+          handedOverAt: new Date(),
+          invoiceIds: (activeDoc.activeCycle.invoices || []).map(i => i.invoiceId)
+        };
+
+        const nextCycleNumber = (activeDoc.completedCycles?.length || 0) + 2;
+        const newActiveCycle = {
+          cycleId: new ObjectId().toString(),
+          cycleNumber: nextCycleNumber,
+          currentStamps: 0,
+          targetStamps: 5,
+          accumulatedRewardValue: 0,
+          status: 'active',
+          invoices: [],
+          createdAt: new Date()
+        };
+
+        await db.collection("customer_stamps").updateOne(
+          { customerPhone: activeDoc.customerPhone },
+          {
+            $push: { completedCycles: completedRecord },
+            $set: { activeCycle: newActiveCycle, updatedAt: new Date() }
+          }
+        );
+
+        return res.json({
+          success: true,
+          message: `Reward gift accepted and recorded successfully! Fresh Cycle #${nextCycleNumber} activated.`,
+          giftGiven: completedRecord.giftGiven
+        });
+      }
+
+      return res.status(404).json({ error: "Reward cycle not found or already redeemed" });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
 
 // Stats Summary
 app.get("/api/stats-summary", async (req, res) => {
@@ -1262,23 +1403,21 @@ app.post("/api/save-estimate", async (req, res) => {
         }
 
         const itemTotal = Number(item.total) || (Number(item.quantity) * Number(item.rate)) || 0;
-        const itemReward = Number(((itemTotal * percent) / 100).toFixed(2));
+        const itemReward = (itemTotal * percent) / 100;
         rawRewardTotal += itemReward;
 
         return {
           ...item,
           gst: (item.gst !== undefined && item.gst !== null) ? Number(item.gst) : 0,
           rewardPercent: percent,
-          rewardValue: itemReward
+          rewardValue: Number(itemReward.toFixed(2))
         };
       });
 
       rawRewardTotal = Number(rawRewardTotal.toFixed(2));
 
-      // Rounding logic: floor to nearest 10 when >= 10, otherwise keep raw reward (e.g. ₹4 on ₹200 SS bill)
-      const invoiceRewardValue = rawRewardTotal >= roundingIncrement 
-        ? Math.floor(rawRewardTotal / roundingIncrement) * roundingIncrement 
-        : Math.round(rawRewardTotal);
+      // 2. Standard mathematical half-up rounding applied ONLY ONCE to final aggregated raw reward
+      const invoiceRewardValue = Math.round(Number(rawRewardTotal.toFixed(4)));
 
       const isQualified = Number(finalAmount) >= minInvoiceAmount;
 
