@@ -1710,6 +1710,23 @@ app.post("/api/save-estimate", async (req, res) => {
     // Async background update of retail_items (for retail) or items (for wholesale)
     setImmediate(async () => {
       try {
+                // Sync customerName to customer_logins and customer_stamps so names match across app & web pass
+        if (cleanPhone && cleanPhone.length === 10 && customerName && customerName.trim()) {
+          try {
+            const trimmedName = customerName.trim();
+            await db.collection("customer_logins").updateMany(
+              { customerPhone: cleanPhone },
+              { $set: { customerName: trimmedName, updatedAt: new Date() } }
+            );
+            await db.collection("customer_stamps").updateOne(
+              { customerPhone: cleanPhone },
+              { $set: { customerName: trimmedName, updatedAt: new Date() } }
+            );
+          } catch (syncErr) {
+            console.warn("⚠️ [Customer Sync] Failed to update customer_logins:", syncErr.message);
+          }
+        }
+
         const targetCollection = isRetailCatalog ? "retail_items" : "items";
         const bulkOps = [];
         
