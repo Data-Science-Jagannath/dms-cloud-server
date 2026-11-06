@@ -777,6 +777,15 @@ app.get("/api/rewards/invoices/:phone", async (req, res) => {
       }
 
       // Find the matching cycle in completedCycles first
+            const billPhone = String(req.query.billPhone || '').replace(/\D/g, '').trim();
+      if (billPhone && billPhone.length === 10 && doc.customerPhone !== billPhone) {
+        return res.status(400).json({
+          success: false,
+          notSameCustomer: true,
+          error: `Not same customer! This redemption code belongs to customer (+91 ${doc.customerPhone}), but current bill is for (+91 ${billPhone}).`
+        });
+      }
+
       let matchedCycle = (doc.completedCycles || []).find(c =>
         c.redemptionCode && String(c.redemptionCode).trim().toUpperCase() === rawCode
       );
@@ -851,6 +860,14 @@ app.get("/api/rewards/invoices/:phone", async (req, res) => {
         : { customerPhone: cleanPhone, "completedCycles.redeemedOnBill": { $ne: true } };
 
       const doc = await db.collection("customer_stamps").findOne(query);
+      if (doc) {
+        if (cleanPhone && cleanPhone.length === 10 && doc.customerPhone && doc.customerPhone !== cleanPhone) {
+          return res.status(400).json({
+            success: false,
+            error: `Not same customer! Reward code belongs to customer (+91 ${doc.customerPhone}), but bill customer is (+91 ${cleanPhone}).`
+          });
+        }
+      }
       if (doc && Array.isArray(doc.completedCycles)) {
         const targetIdx = doc.completedCycles.findIndex(c =>
           rawCode ? (c.redemptionCode && String(c.redemptionCode).trim().toUpperCase() === rawCode) : !c.redeemedOnBill
