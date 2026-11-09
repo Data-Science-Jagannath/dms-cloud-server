@@ -1637,7 +1637,7 @@ app.post("/api/save-estimate", async (req, res) => {
       remainingDue,
       financial_summary: {
         bill_amount: finalAmount,
-        discount: isRetailGst ? 0 : (Number(discount) || 0),
+        discount: Number(discount) || 0,
         previous_balance: isRetailGst ? 0 : oldBalance,
         total_payable: isRetailGst ? finalAmount : totalOutstanding,
         cash_paid: isRetailGst ? finalAmount : (Number(cashAmount) || 0),
@@ -1654,7 +1654,14 @@ app.post("/api/save-estimate", async (req, res) => {
     if (isRetailGst) {
       masterPayload.scrapItems = [];
       masterPayload.scrapTotal = 0;
-      masterPayload.discount = 0;
+      masterPayload.discount = Number(discount) || 0;
+      masterPayload.invoiceGrossTotal = Number(req.body.invoiceGrossTotal ?? newTotal) || 0;
+      masterPayload.invoiceTotalDiscount = Number(req.body.invoiceTotalDiscount ?? discount) || 0;
+      masterPayload.invoiceNetPayable = Number(req.body.invoiceNetPayable ?? (newTotal - (discount || 0))) || 0;
+      masterPayload.invoiceTotalTaxable = Number(req.body.invoiceTotalTaxable) || 0;
+      masterPayload.invoiceTotalCgst = Number(req.body.invoiceTotalCgst) || 0;
+      masterPayload.invoiceTotalSgst = Number(req.body.invoiceTotalSgst) || 0;
+      masterPayload.totalTax = Number(req.body.totalTax) || 0;
       masterPayload.oldBalance = 0;
       masterPayload.paidAmount = finalAmount;
       masterPayload.remainingDue = 0;
