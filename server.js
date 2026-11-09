@@ -1419,8 +1419,10 @@ app.post("/api/save-estimate", async (req, res) => {
           percent = specialRewardPercent;
         }
 
-        const itemTotal = Number(item.total) || (Number(item.quantity) * Number(item.rate)) || 0;
-        const itemReward = (itemTotal * percent) / 100;
+        const baseAmount = (item.taxable !== undefined && item.taxable !== null)
+          ? Number(item.taxable)
+          : (Number(item.total) || (Number(item.quantity) * Number(item.rate)) || 0);
+        const itemReward = (baseAmount * percent) / 100;
         rawRewardTotal += itemReward;
 
         return {
